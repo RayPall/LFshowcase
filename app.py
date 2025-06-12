@@ -3,9 +3,9 @@ seo_article_generator.py
 
 Streamlit aplikace, která:
 1) Vyhledá TOP 3 výsledky Googlu přes SerpAPI
-2) Stáhne jejich HTML (správně rozpozná kódování) a vytáhne klíčová slova
+2) Stáhne jejich HTML (vždy dekóduje přes apparent_encoding) a vytáhne klíčová slova
 3) Vygeneruje **pouze osnovu** článku (H1/H2/H3 + bullet-pointy),
-   meta-title, meta-description a návrhy interních odkazů.
+   meta‐title, meta‐description a návrhy interních odkazů.
 
 Potřebné proměnné prostředí / Streamlit Secrets:
   • SERPAPI_API_KEY
@@ -26,7 +26,7 @@ import tldextract
 # ─────────────────────────────────────────────────────────────────────────────
 # API klíče & klient
 SERP_API_KEY = os.getenv("SERPAPI_API_KEY")
-client = OpenAI()  # načte OPENAI_API_KEY z env
+client       = OpenAI()  # načte OPENAI_API_KEY z env
 
 # základní stop-slova (CZ + EN)
 STOP_WORDS = {
@@ -43,19 +43,17 @@ STOP_WORDS = {
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_html(url: str) -> str:
     """
-    Stáhne HTML a vynutí správné kódování, aby nezůstalo mojibake.
+    Stáhne HTML a vždy dekóduje bajty přes apparent_encoding (ne .text),
+    aby se předešlo mojibake.
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; SEOArticleBot/1.0; +https://example.com/bot)"
+        "User-Agent": "Mozilla/5.0 (compatible; SEOArticleBot/1.0)"
     }
     try:
         r = requests.get(url, headers=headers, timeout=15)
         if r.ok:
-            # pokud server neposílá encoding, nebo poslal UTF-8 chybně,
-            # použij heuristiku requests.apparent_encoding
-            if not r.encoding or r.encoding.lower() == "utf-8":
-                r.encoding = r.apparent_encoding or "utf-8"
-            return r.text
+            encoding = r.apparent_encoding or "utf-8"
+            return r.content.decode(encoding, errors="replace")
     except requests.RequestException:
         pass
     return ""
@@ -66,27 +64,27 @@ def keyword_frequency(text: str, top_n: int = 20):
     odfiltruje stop-slova a vrátí top_n nejčastějších.
     """
     # \b hranice slova, [^\W\d_] = jen písmena Unicode, {3,} minimálně tři
-    tokens = re.findall(r"\b[^\W\d_]{3,}\b", text.lower(), flags=re.UNICODE)
+    tokens   = re.findall(r"\b[^\W\d_]{3,}\b", text.lower(), flags=re.UNICODE)
     filtered = [t for t in tokens if t not in STOP_WORDS]
     return Counter(filtered).most_common(top_n)
 
 def analyse_page(url: str):
     """
-    Stáhne stránku, očistí skripty/styly, vrátí náhled textu a KW.
+    Stáhne stránku, odstraní skripty/styly, vrátí náhled textu a KW.
     """
     html = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script","style","noscript"]):
         tag.extract()
     text = " ".join(soup.stripped_strings)
-    kw = keyword_frequency(text)
-    return text[:2000], kw  # náhled první 2000 znaků + seznam (slovo, četnost)
+    kw   = keyword_frequency(text)
+    return text[:2000], kw  # náhled prvních 2 000 znaků + seznam (slovo, četnost)
 
 def search_google(query: str, num_results: int = 3):
     """
     Vrátí organické výsledky SerpAPI pro zadaný dotaz.
     """
-    params = {
+    params  = {
         "engine": "google",
         "q": query,
         "num": num_results,
@@ -98,10 +96,10 @@ def search_google(query: str, num_results: int = 3):
 
 def propose_outline(query: str, top_keywords, analyses):
     """
-    Vygeneruje jen **osnovu** článku v Markdownu:
+    Vygeneruje **pouze osnovu** článku v Markdownu:
       • H1/H2/H3 + bullet-pointy
       • meta-title (≤60 char), meta-description (≤155 char)
-      • návrhy 3–5 interních odkazů
+      • návrh 3–5 interních odkazů
     """
     system = (
         "You are an expert Czech SEO strategist. "
@@ -152,7 +150,6 @@ if query:
         title = res.get("title") or url
 
         st.subheader(title)
-        # doména (např. example.com)
         try:
             ext = tldextract.extract(url)
             domain = ".".join(p for p in [ext.domain, ext.suffix] if p)
@@ -170,7 +167,6 @@ if query:
 
         analyses.append({"url": url, "keywords": [w for w, _ in kw]})
 
-    # agregace klíčových slov napříč konkurencí
     combined = Counter()
     for a in analyses:
         combined.update(a["keywords"])
