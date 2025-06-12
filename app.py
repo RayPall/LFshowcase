@@ -1,172 +1,194 @@
-"""seo_article_generator.py – Streamlit app for SEO article ideation
-====================================================================
-
-Fix 06‑2025‑06‑12
------------------
-* **Bugfix:** replace unsupported regex using `\p{L}` (causing `re.PatternError`) with
-  a safe Unicode‑aware pattern `\b\w{2,}\b`. No extra dependency required.
-* Added richer Czech + English stop‑word list.
-* Minor: show full traceback in Streamlit `st.exception` for easier debugging.
-
-Usage
------
-```bash
-# local run
-export SERPAPI_API_KEY="..."
-export OPENAI_API_KEY="..."
-streamlit run seo_article_generator.py
-```
-
-Dependencies are pinned in `requirements.txt` (must include
-`streamlit`, `google-search-results`, `beautifulsoup4`, `tldextract`, `openai`).
-
 """
-from __future__ import annotations
+seo_article_generator.py
+Streamlit aplikace, která:
+1. Provede Google vyhledávání (SerpAPI) na zadaný dotaz
+2. Stáhne a SEO-analyzuje 3 nejvýše postavené výsledky
+3. Vygeneruje návrh SEO článku, který cílí na TOP 3
+
+⚙️  Potřeba API klíče:
+   • SERPAPI_API_KEY
+   • OPENAI_API_KEY
+   (ulož jako proměnné prostředí nebo ve Streamlit Cloud → Secrets)
+"""
 
 import os
 import re
-import html
-import json
 import requests
-import collections
-from typing import List, Tuple
+from collections import Counter
 
 import streamlit as st
 from bs4 import BeautifulSoup
-from tldextract import extract as tld_extract
-from serpapi import GoogleSearch  # provided by google-search-results
+from serpapi import GoogleSearch
 from openai import OpenAI
+import tldextract
 
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
-client = OpenAI()  # OPENAI_API_KEY picked up from env vars
+# ── Klíče & klienti ───────────────────────────────────────────────────────────
 
-TOP_N_KEYWORDS = 25
+SERP_API_KEY = os.getenv("SERPAPI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+client = OpenAI()  # načte OPENAI_API_KEY z prostředí
+
+# ── Stop-slova pro EN + CZ (základní) ─────────────────────────────────────────
 
 STOP_WORDS = {
-    # Czech
-    "a", "i", "aby", "aj", "ale", "anebo", "ani", "asi", "atd", "atp", "bez", "bude", "budou", "by", "byl", "byla", "byli", "bylo", "byly", "co", "či", "dál", "další", "den", "deset", "dnes", "do", "ho", "i", "jak", "jedna", "jedné", "jedni", "jedno", "jsme", "jiný", "kam", "kde", "kdo", "kdy", "když", "ke", "kolik", "která", "které", "který", "mít", "mně", "může", "my", "na", "nad", "nam", "námi", "nás", "náš", "ne", "některý", "než", "nic", "nich", "ním", "nímž", "níž", "nyní", "o", "od", "pak", "po", "pod", "podle", "pokud", "proto", "proč", "před", "přes", "při", "s", "se", "si", "tak", "tato", "tě", "těch", "to", "tohle", "tom", "tomto", "tomu", "toto", "třeba", "tu", "tuto", "ty", "tím", "tímto", "u", "v", "vám", "vámi", "vás", "váš", "ve", "vedle", "však", "všechen", "vy", "z", "za", "zatím", "že",
-    # English
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "s", "same", "she", "should", "so", "some", "such", "t", "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with", "you", "your", "yours", "yourself", "yourselves",
+    # english
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is",
+    "are", "be", "as", "at", "by", "this", "that", "from", "it", "its", "will",
+    "was", "were", "has", "have", "had", "but", "not", "your", "you",
+    # czech
+    "a", "i", "k", "o", "u", "s", "v", "z", "na", "že", "se", "je", "jsou",
+    "by", "byl", "byla", "bylo", "aby", "do", "od", "po", "pro", "pod", "nad",
+    "který", "která", "které", "co", "to", "toto", "tyto", "ten", "ta", "tím",
+    "tuto", "tu", "jako", "kde", "kdy", "jak", "tak", "také", "bez",
 }
 
-# --------------------------------------------------
-# UTILITIES
-# --------------------------------------------------
+# ── Pomocné funkce ────────────────────────────────────────────────────────────
 
-def keyword_frequency(text: str, top_n: int = TOP_N_KEYWORDS) -> List[Tuple[str, int]]:
-    """Return the `top_n` most common keywords from *text* (after stop‑word removal).
-    Uses a safe Unicode‑aware regex. Skips tokens shorter than 2 chars.
+
+def keyword_frequency(text: str, top_n: int = 20):
+    """
+    Vrátí `top_n` nejčastějších tokenů s délkou ≥ 2 znaky,
+    očištěné o stop-slova a čísla.
     """
     tokens = re.findall(r"\b\w{2,}\b", text.lower(), flags=re.UNICODE)
     tokens = [t for t in tokens if t not in STOP_WORDS and not t.isdigit()]
-    return collections.Counter(tokens).most_common(top_n)
+    return Counter(tokens).most_common(top_n)
 
 
-def serpapi_search(query: str, num_results: int = 3) -> List[dict]:
-    search = GoogleSearch({
+def fetch_html(url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; SEOArticleBot/1.0; "
+            "+https://example.com/bot)"
+        )
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.ok:
+            return r.text
+    except requests.RequestException:
+        pass
+    return ""
+
+
+def analyse_page(url: str):
+    html = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    # zahodíme skripty / styly
+    for s in soup(["script", "style", "noscript"]):
+        s.extract()
+
+    text = " ".join(soup.stripped_strings)
+    kw = keyword_frequency(text)
+    return text[:2000], kw  # vrátíme ukázku + klíčová slova
+
+
+def search_google(query: str, num_results: int = 3):
+    params = {
+        "engine": "google",
         "q": query,
         "num": num_results,
-        "api_key": SERPAPI_API_KEY,
+        "api_key": SERP_API_KEY,
         "hl": "cs",
-        "gl": "cz",
-    })
+    }
+    search = GoogleSearch(params)
     results = search.get_dict()
     return results.get("organic_results", [])[:num_results]
 
 
-def fetch_page_html(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }
-    try:
-        r = requests.get(url, timeout=20, headers=headers)
-        r.raise_for_status()
-        return r.text
-    except Exception as exc:
-        st.warning(f"Nepodařilo se stáhnout {url}: {exc}")
-        return ""
+def propose_article(query: str, top_keywords, analyses):
+    """
+    Zavolá OpenAI Chat Completion a vrátí Markdown s článkem.
+    """
+    system = (
+        "You are an expert Czech SEO copywriter. "
+        "Generate a detailed SEO article outline followed by the full article "
+        "text in Czech that can rank in Google's top 3 for the given query. "
+        "Integrate the provided keywords naturally."
+    )
 
+    user = (
+        f"Search query: {query}\n"
+        f"Aggregated competitor keywords: {', '.join(top_keywords)}\n\n"
+        f"Competitor notes:\n"
+    )
+    for i, a in enumerate(analyses, 1):
+        user += (
+            f"{i}. {a['url']}\n"
+            f"   keywords: {', '.join(a['keywords'])[:120]}\n"
+        )
 
-def extract_visible_text(html_text: str) -> str:
-    soup = BeautifulSoup(html_text, "html.parser")
-    # Remove script/style
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    return soup.get_text(separator=" ", strip=True)
-
-
-def analyse_page(url: str) -> tuple[str, list[tuple[str,int]]]:
-    html_raw = fetch_page_html(url)
-    plain = extract_visible_text(html_raw)
-    kw = keyword_frequency(plain)
-    return plain, kw
-
-
-def propose_article(query: str, top_keywords: list[str], analyses: list[dict]) -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert Czech SEO copywriter. Based on provided keyword "
-                "list and competitor analyses, draft an outline and 400‑600 word "
-                "article that can rank in Google Top 3. Write in Czech. Use clear "
-                "H2/H3 headings and short paragraphs."
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps({
-                "query": query,
-                "top_keywords": top_keywords,
-                "competitors": analyses,
-            }, ensure_ascii=False),
-        },
-    ]
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=messages,
-        max_tokens=1024,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_tokens=2048,
         temperature=0.7,
     )
     return response.choices[0].message.content.strip()
 
 
-# --------------------------------------------------
-# STREAMLIT UI
-# --------------------------------------------------
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="SEO Article Idea Generator", page_icon="🔍", layout="centered")
-st.title("🔍 SEO Article Idea Generator")
+st.set_page_config(page_title="SEO Article Idea Generator", page_icon="🔍")
+st.title("🔍 SEO Article Idea Generator")
 
-query = st.text_input("Zadej vyhledávací dotaz")
+query = st.text_input("Zadej vyhledávací dotaz", value="")
 
 if query:
-    with st.spinner("Analyzuji výsledky…"):
-        organic = serpapi_search(query)
-        if not organic:
-            st.error("Nenalezeny žádné výsledky.")
-            st.stop()
+    # kontrola klíčů
+    if not SERP_API_KEY or not OPENAI_API_KEY:
+        st.error("❌ Chybí `SERPAPI_API_KEY` nebo `OPENAI_API_KEY`.")
+        st.stop()
 
-        analyses = []
-        for res in organic:
-            url = res.get("link")
-            domain = ".".join(part for part in tld_extract(url) if part)
-            st.markdown(f"### 🔗 {domain}")
-            plain, kw = analyse_page(url)
-            st.markdown("**Top klíčová slova:** " + ", ".join([f"`{w}`" for w, _ in kw]))
-            analyses.append({"url": url, "keywords": [w for w, _ in kw]})
+    st.info("⏳ Vyhledávám a analyzuji konkurenci…")
 
-        # agreguj klíčová slova (průnik/top TF‑IDF není třeba pro demo)
-        all_kw = collections.Counter([w for a in analyses for w in a["keywords"]]).most_common(40)
-        top_kw = [w for w, _ in all_kw[:25]]
+    results = search_google(query)
+    if not results:
+        st.error("Google/SerpAPI nevrátil žádné výsledky.")
+        st.stop()
 
-    st.subheader("📝 Návrh článku")
-    try:
-        article_md = propose_article(query, top_kw, analyses)
-        st.markdown(article_md)
-    except Exception as exc:
-        st.exception(exc)
+    analyses = []
+
+    for res in results:
+        url = res.get("link")
+        title = res.get("title")
+
+        # Vykreslení titulku + domény
+        st.subheader(title or url)
+        try:
+            ext = tldextract.extract(url)
+            domain_parts = [ext.domain, ext.suffix]
+            domain = ".".join(p for p in domain_parts if p)
+        except Exception:
+            domain = url
+        st.caption(domain)
+
+        # SEO analýza stránky
+        preview, kw = analyse_page(url)
+        st.markdown(
+            "**Top klíčová slova konkurence:** "
+            + ", ".join(f"`{w}`" for w, _ in kw)
+        )
+        with st.expander("Ukázka textu"):
+            st.write(preview)
+
+        analyses.append({"url": url, "keywords": [w for w, _ in kw]})
+
+    # agregace klíčových slov napříč konkurencí
+    combined = Counter()
+    for a in analyses:
+        combined.update(a["keywords"])
+    top_kw = [w for w, _ in combined.most_common(30)]
+
+    st.info("📝 Generuji návrh článku…")
+    article_md = propose_article(query, top_kw, analyses)
+
+    st.markdown("---")
+    st.subheader("📄 Návrh SEO článku")
+    st.markdown(article_md, unsafe_allow_html=True)
+    st.success("✅ Hotovo – článek vygenerován!")
