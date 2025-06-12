@@ -78,4 +78,101 @@ def analyse_page(url: str):
 
 def search_google(query: str, num_results: int = 5):
     """
-    Vrátí prvních num_results organických výsledků SerpAPI pro zadaný dota_
+    Vrátí prvních num_results organických výsledků SerpAPI pro zadaný dotaz.
+    """
+    params  = {
+        "engine": "google",
+        "q": query,
+        "num": num_results,
+        "api_key": SERP_API_KEY,
+        "hl": "cs",
+    }
+    results = GoogleSearch(params).get_dict()
+    return results.get("organic_results", [])[:num_results]
+
+def propose_outline(query: str, top_keywords, analyses):
+    """
+    Vygeneruje **pouze osnovu** článku v Markdownu:
+      • H1/H2/H3 + bullet-pointy
+      • meta-title (≤60 char), meta-description (≤155 char)
+      • návrh 3–5 interních odkazů
+    """
+    system = (
+        "You are an expert Czech SEO strategist. "
+        "Generate ONLY a detailed outline (H1, H2, optional H3) with bullet-point notes, "
+        "a meta-title (<=60 chars) and meta-description (<=155 chars), "
+        "and suggest 3–5 internal links (anchor text + slug). "
+        "Do NOT write full paragraphs."
+    )
+    user = (
+        f"Search query: {query}\n"
+        f"Aggregated competitor keywords: {', '.join(top_keywords)}\n\n"
+        "Competitor snapshot:\n"
+    )
+    for i, a in enumerate(analyses, 1):
+        user += f"{i}. {a['url']}\n   keywords: {', '.join(a['keywords'])[:120]}\n"
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system", "content": system},
+            {"role":"user",   "content": user}
+        ],
+        max_tokens=1024,
+        temperature=0.7,
+    )
+    return resp.choices[0].message.content.strip()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+st.set_page_config(page_title="SEO Article Outline Generator", page_icon="🔍")
+st.title("🔍 SEO Article Outline Generator")
+
+query = st.text_input("Zadej vyhledávací dotaz", value="")
+if query:
+    if not SERP_API_KEY or not os.getenv("OPENAI_API_KEY"):
+        st.error("❌ Chybí `SERPAPI_API_KEY` nebo `OPENAI_API_KEY`.")
+        st.stop()
+
+    st.info("⏳ Vyhledávám a analyzuji konkurenci…")
+    # nově 5 výsledků namísto 3
+    results = search_google(query, num_results=5)
+    if not results:
+        st.error("Google/SerpAPI nevrátil žádné výsledky.")
+        st.stop()
+
+    analyses = []
+    for res in results:
+        url   = res.get("link")
+        title = res.get("title") or url
+
+        st.subheader(title)
+        try:
+            ext = tldextract.extract(url)
+            domain = ".".join(p for p in [ext.domain, ext.suffix] if p)
+        except Exception:
+            domain = url
+        st.caption(domain)
+
+        preview, kw = analyse_page(url)
+        st.markdown(
+            "**Top klíčová slova konkurence:** "
+            + ", ".join(f"`{w}`" for w, _ in kw)
+        )
+        with st.expander("Ukázka textu"):
+            st.write(preview)
+
+        analyses.append({"url": url, "keywords": [w for w, _ in kw]})
+
+    combined = Counter()
+    for a in analyses:
+        combined.update(a["keywords"])
+    top_kw = [w for w, _ in combined.most_common(30)]
+
+    st.info("📝 Generuji osnovu článku…")
+    outline_md = propose_outline(query, top_kw, analyses)
+
+    st.markdown("---")
+    st.subheader("📄 Návrh (outline) SEO článku")
+    st.markdown(outline_md, unsafe_allow_html=True)
+    st.success("✅ Osnova vygenerována!")
