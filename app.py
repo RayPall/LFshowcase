@@ -1,13 +1,5 @@
 """
-SEO Article Outline Generator (2025-ready)
------------------------------------------
-* Google/SerpAPI vyhledá top 3 URL
-* Pro každou:
-    – stáhne HTML, detekuje encoding
-    – vytáhne top KW + TF-IDF LSI KW
-* Vygeneruje **pouze outline** článku:
-    H1 → H2 → H3, bullet-pointy, meta-title, meta-description,
-    návrhy interních odkazů.
+seo_article_generator.py – včetně fixu SnowballStemmer
 """
 
 import os
@@ -24,15 +16,15 @@ import tldextract
 # NLP & TF-IDF
 from sklearn.feature_extraction.text import TfidfVectorizer
 import nltk
-from nltk.stem.snowball import CzechStemmer, EnglishStemmer
+from nltk.stem.snowball import SnowballStemmer   # ← opravený import
 
 nltk.download("punkt", quiet=True)
 
-# ── API klíče ──────────────
+# ── API klíče ────────────────────────────────────────────────────────────────
 SERP_API_KEY = os.getenv("SERPAPI_API_KEY")
-client = OpenAI()                     # vezme OPENAI_API_KEY z env
+client = OpenAI()                                # vezme OPENAI_API_KEY z env
 
-# ── stop-wordy ─────────────
+# ── stop-slova ───────────────────────────────────────────────────────────────
 STOP_WORDS = set("""
 the a an and or of to in on for with is are be as at by this that from it its
 will was were has have had but not your you
@@ -40,10 +32,10 @@ a i k o u s v z na že se je jsou by byl byla bylo aby do od po pro pod nad
 který která které co to toto tyto ten ta tím tuto tu jako kde kdy jak tak také bez
 """.split())
 
-CS_STEM = CzechStemmer()
-EN_STEM = EnglishStemmer()
+CS_STEM = SnowballStemmer("czech")      # ← vytvoříme instanci pro češtinu
+EN_STEM = SnowballStemmer("english")    # ← a pro angličtinu
 
-# ── heuristická detekce intentu ─────
+# ── heuristická detekce intentu ──────────────────────────────────────────────
 def detect_intent(q: str) -> str:
     q = q.lower()
     trans_kw = {"koupit", "cena", "objednat", "recenze", "srovnání", "discount"}
@@ -53,11 +45,9 @@ def detect_intent(q: str) -> str:
         return "informational"
     return "informational"
 
-# ── parsování HTML + KW ─────
+# ── parsování HTML + KW ──────────────────────────────────────────────────────
 def fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (SEOOutlineBot/1.0; +https://example.com/bot)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (SEOOutlineBot/1.0; +https://example.com/bot)"}
     try:
         r = requests.get(url, headers=headers, timeout=15)
         if r.ok:
@@ -74,9 +64,8 @@ def keyword_frequency(text: str, lang="cz", top_n=20):
     stemmer = CS_STEM if lang == "cz" else EN_STEM
     stems = [stemmer.stem(t) for t in tokens]
     counts = defaultdict(int)
-    for original, stem in zip(tokens, stems):
-        counts[stem] += 1
-    # map back to most common original word for each stem
+    for _, st in zip(tokens, stems):
+        counts[st] += 1
     stem_to_word = {}
     for w in tokens:
         st = stemmer.stem(w)
@@ -85,12 +74,13 @@ def keyword_frequency(text: str, lang="cz", top_n=20):
     return [(stem_to_word[s], c) for s, c in Counter(counts).most_common(top_n)]
 
 def get_lsi_keywords(docs, top_n=10):
-    vectorizer = TfidfVectorizer(max_features=2000, ngram_range=(1, 2), stop_words=list(STOP_WORDS))
+    vectorizer = TfidfVectorizer(max_features=2000, ngram_range=(1, 2),
+                                 stop_words=list(STOP_WORDS))
     X = vectorizer.fit_transform(docs)
-    tfidf_scores = X.sum(axis=0).A1
-    idx_sorted = tfidf_scores.argsort()[::-1][: top_n]
+    scores = X.sum(axis=0).A1
+    idx = scores.argsort()[::-1][:top_n]
     feats = vectorizer.get_feature_names_out()
-    return [feats[i] for i in idx_sorted]
+    return [feats[i] for i in idx]
 
 def analyse_page(url: str):
     html = fetch_html(url)
@@ -98,8 +88,8 @@ def analyse_page(url: str):
     for s in soup(["script", "style", "noscript"]):
         s.extract()
     text = " ".join(soup.stripped_strings)
-    kws = keyword_frequency(text)
-    return text[:2000], kws, text
+    kw = keyword_frequency(text)
+    return text[:2000], kw, text
 
 def search_google(query: str, n=3):
     search = GoogleSearch({
@@ -130,14 +120,16 @@ def propose_outline(query, intent, top_kw, lsi_kw, analyses):
         user += f"{i}. {a['url']}\n   KW: {', '.join(a['keywords'][:10])}\n"
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
         max_tokens=900,
         temperature=0.7,
     )
     return resp.choices[0].message.content.strip()
 
-# ── UI ─────────────────────
+# ── Streamlit UI ─────────────────────────────────────────────────────────────
 st.set_page_config("SEO Outline Generator", "🔍")
 st.title("🔍 SEO Article Outline Generator")
 
@@ -173,7 +165,6 @@ if q:
                 st.write(preview)
             analyses.append({"url": url, "keywords": [w for w, _ in kw]})
 
-    # agregace KW + LSI
     comb = Counter()
     for a in analyses:
         comb.update(a["keywords"])
