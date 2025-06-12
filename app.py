@@ -34,7 +34,7 @@ from typing import List, Tuple
 import streamlit as st
 from bs4 import BeautifulSoup
 from tldextract import extract as tld_extract
-from google_search_results import GoogleSearch  # provided by google-search-results
+from serpapi import GoogleSearch  # provided by google-search-results
 from openai import OpenAI
 
 # --------------------------------------------------
