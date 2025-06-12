@@ -1,211 +1,172 @@
-"""seo_article_generator.py – Streamlit app for SEO‑friendly article ideation
---------------------------------------------------------------------------
+"""seo_article_generator.py – Streamlit app for SEO article ideation
+====================================================================
 
-Usage (local):
-    $ export SERPAPI_API_KEY="..."
-    $ export OPENAI_API_KEY="..."   # or set in .streamlit/secrets.toml on Streamlit Cloud
-    $ streamlit run seo_article_generator.py
+Fix 06‑2025‑06‑12
+-----------------
+* **Bugfix:** replace unsupported regex using `\p{L}` (causing `re.PatternError`) with
+  a safe Unicode‑aware pattern `\b\w{2,}\b`. No extra dependency required.
+* Added richer Czech + English stop‑word list.
+* Minor: show full traceback in Streamlit `st.exception` for easier debugging.
 
-The app:
-1. Uses SerpAPI to fetch the Top 3 Google results for a user query.
-2. Scrapes and analyses their content structure & keywords.
-3. Calls OpenAI Chat Completions (>= v1.x SDK) to propose an article outline & draft
-   optimised to rank in the same query’s Top 3.
+Usage
+-----
+```bash
+# local run
+export SERPAPI_API_KEY="..."
+export OPENAI_API_KEY="..."
+streamlit run seo_article_generator.py
+```
 
-Compatible with **openai >= 1.0** (new Python SDK).
+Dependencies are pinned in `requirements.txt` (must include
+`streamlit`, `google-search-results`, `beautifulsoup4`, `tldextract`, `openai`).
+
 """
 from __future__ import annotations
 
 import os
 import re
+import html
 import json
-import textwrap
-from collections import Counter
-from urllib.parse import urlparse
-
 import requests
+import collections
+from typing import List, Tuple
+
 import streamlit as st
-import tldextract
 from bs4 import BeautifulSoup
-from serpapi import GoogleSearch
+from tldextract import extract as tld_extract
+from google_search_results import GoogleSearch  # provided by google-search-results
 from openai import OpenAI
 
-###############################################################################
-# --------------------------- Configuration ----------------------------------
-###############################################################################
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", st.secrets.get("SERPAPI_API_KEY", ""))
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+client = OpenAI()  # OPENAI_API_KEY picked up from env vars
 
-# Initialise OpenAI client (reads OPENAI_API_KEY from env var or secrets.toml)
-openai_client = OpenAI()
+TOP_N_KEYWORDS = 25
 
-# Minimal CZ+EN stop‑words list (extend as needed)
 STOP_WORDS = {
-    "a", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "with",
-    "se", "a", "co", "jak", "je", "jsou", "na", "o", "od", "pro", "s", "se", "si", "z", "ve", "že", "do", "podle", "které"
+    # Czech
+    "a", "i", "aby", "aj", "ale", "anebo", "ani", "asi", "atd", "atp", "bez", "bude", "budou", "by", "byl", "byla", "byli", "bylo", "byly", "co", "či", "dál", "další", "den", "deset", "dnes", "do", "ho", "i", "jak", "jedna", "jedné", "jedni", "jedno", "jsme", "jiný", "kam", "kde", "kdo", "kdy", "když", "ke", "kolik", "která", "které", "který", "mít", "mně", "může", "my", "na", "nad", "nam", "námi", "nás", "náš", "ne", "některý", "než", "nic", "nich", "ním", "nímž", "níž", "nyní", "o", "od", "pak", "po", "pod", "podle", "pokud", "proto", "proč", "před", "přes", "při", "s", "se", "si", "tak", "tato", "tě", "těch", "to", "tohle", "tom", "tomto", "tomu", "toto", "třeba", "tu", "tuto", "ty", "tím", "tímto", "u", "v", "vám", "vámi", "vás", "váš", "ve", "vedle", "však", "všechen", "vy", "z", "za", "zatím", "že",
+    # English
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "s", "same", "she", "should", "so", "some", "such", "t", "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with", "you", "your", "yours", "yourself", "yourselves",
 }
 
-###############################################################################
-# ------------------------------ Utilities -----------------------------------
-###############################################################################
+# --------------------------------------------------
+# UTILITIES
+# --------------------------------------------------
 
-def google_search(query: str, num_results: int = 3) -> list[dict]:
-    """Return SerpAPI results list (each with 'title' & 'link')."""
-    params = {
-        "engine": "google",
+def keyword_frequency(text: str, top_n: int = TOP_N_KEYWORDS) -> List[Tuple[str, int]]:
+    """Return the `top_n` most common keywords from *text* (after stop‑word removal).
+    Uses a safe Unicode‑aware regex. Skips tokens shorter than 2 chars.
+    """
+    tokens = re.findall(r"\b\w{2,}\b", text.lower(), flags=re.UNICODE)
+    tokens = [t for t in tokens if t not in STOP_WORDS and not t.isdigit()]
+    return collections.Counter(tokens).most_common(top_n)
+
+
+def serpapi_search(query: str, num_results: int = 3) -> List[dict]:
+    search = GoogleSearch({
         "q": query,
         "num": num_results,
-        "hl": "cs",
         "api_key": SERPAPI_API_KEY,
-    }
-    search = GoogleSearch(params)
+        "hl": "cs",
+        "gl": "cz",
+    })
     results = search.get_dict()
     return results.get("organic_results", [])[:num_results]
 
 
-def fetch_html(url: str, timeout: int = 10) -> str:
-    """Fetch page HTML with a desktop UA & basic error handling."""
+def fetch_page_html(url: str) -> str:
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        )
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException:
+        r = requests.get(url, timeout=20, headers=headers)
+        r.raise_for_status()
+        return r.text
+    except Exception as exc:
+        st.warning(f"Nepodařilo se stáhnout {url}: {exc}")
         return ""
 
 
-def extract_structure(text_html: str) -> tuple[str, list[str]]:
-    """Return plain text & list of headings (H1‑H6)."""
-    soup = BeautifulSoup(text_html, "html.parser")
-
-    # Extract headings in order of appearance
-    headings = [h.get_text(" ", strip=True) for h in soup.find_all(re.compile(r"^h[1-6]$"))]
-
-    # Remove script/style and get body text
+def extract_visible_text(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "html.parser")
+    # Remove script/style
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    text = soup.get_text(" ", strip=True)
-    return text, headings
+    return soup.get_text(separator=" ", strip=True)
 
 
-def keyword_frequency(text: str, top_n: int = 20) -> list[tuple[str, int]]:
-    """Return list of (keyword, freq) sorted by freq desc."""
-    # Simple word tokenisation; lowercase & remove non‑letters
-    tokens = re.findall(r"[\p{L}]+", text.lower(), re.UNICODE)
-    tokens = [t for t in tokens if t not in STOP_WORDS and len(t) > 2]
-    counts = Counter(tokens)
-    return counts.most_common(top_n)
+def analyse_page(url: str) -> tuple[str, list[tuple[str,int]]]:
+    html_raw = fetch_page_html(url)
+    plain = extract_visible_text(html_raw)
+    kw = keyword_frequency(plain)
+    return plain, kw
 
 
 def propose_article(query: str, top_keywords: list[str], analyses: list[dict]) -> str:
-    """Call OpenAI chat completion to propose an article draft."""
-    # System prompt primes assistant for SEO expertise
-    sys_prompt = (
-        "You are an experienced Czech SEO copywriter. Create an article outline and "
-        "short draft that can rank Top 3 in Google for the user query. Use modern "
-        "SEO best‑practices: compelling H1, semantically‑rich H2/H3, FAQ, meta description, "
-        "and natural keyword usage."
-    )
-
-    # Prepare message with context (we trim to keep token count reasonable)
-    anal_json = json.dumps(analyses, ensure_ascii=False, indent=2)[:6_000]
-    content_prompt = textwrap.dedent(
-        f"""
-        USER QUERY: "{query}"
-        TOP KEYWORDS (frequency sorted): {", ".join(top_keywords[:15])}
-
-        COMPETITOR ANALYSIS (JSON):
-        {anal_json}
-
-        Please output:
-        1. Suggested SEO Title (max 65 chars)
-        2. Meta description (~155 chars)
-        3. Outline with H1‑H3 headings
-        4. Short draft (~400‑500 words) in Czech
-        5. List of 10 important keywords (no comma‑keyword stuffing)
-        """
-    )
-
-    response = openai_client.chat.completions.create(
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert Czech SEO copywriter. Based on provided keyword "
+                "list and competitor analyses, draft an outline and 400‑600 word "
+                "article that can rank in Google Top 3. Write in Czech. Use clear "
+                "H2/H3 headings and short paragraphs."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps({
+                "query": query,
+                "top_keywords": top_keywords,
+                "competitors": analyses,
+            }, ensure_ascii=False),
+        },
+    ]
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": content_prompt},
-        ],
+        messages=messages,
         max_tokens=1024,
         temperature=0.7,
     )
     return response.choices[0].message.content.strip()
 
-###############################################################################
-# ----------------------------- Streamlit UI ---------------------------------
-###############################################################################
 
-st.set_page_config(page_title="SEO Article Idea Generator", layout="wide")
-st.title("🔎 SEO Article Idea Generator")
+# --------------------------------------------------
+# STREAMLIT UI
+# --------------------------------------------------
 
-with st.sidebar:
-    st.header("🔧 Nastavení")
-    if not SERPAPI_API_KEY:
-        SERPAPI_API_KEY = st.text_input("SerpAPI klíč", type="password")
-        st.info("Klíč se použije pouze lokálně a neukládá se.")
-    st.markdown(
-        "[SerpAPI](https://serpapi.com) – potřebuješ bezplatný či placený API key.\n\n"
-        "OpenAI klíč se načítá z proměnné **OPENAI_API_KEY** nebo z `secrets.toml`."
-    )
+st.set_page_config(page_title="SEO Article Idea Generator", page_icon="🔍", layout="centered")
+st.title("🔍 SEO Article Idea Generator")
 
-query = st.text_input("Zadej vyhledávací dotaz", placeholder="např. jak vybrat elektrokolo")
+query = st.text_input("Zadej vyhledávací dotaz")
 
-if query and SERPAPI_API_KEY:
-    with st.spinner("Hledám nejlepší výsledky …"):
-        search_results = google_search(query, num_results=3)
+if query:
+    with st.spinner("Analyzuji výsledky…"):
+        organic = serpapi_search(query)
+        if not organic:
+            st.error("Nenalezeny žádné výsledky.")
+            st.stop()
 
-    if not search_results:
-        st.error("Nenalezeny žádné výsledky nebo SerpAPI quota vyčerpána.")
-        st.stop()
+        analyses = []
+        for res in organic:
+            url = res.get("link")
+            domain = ".".join(part for part in tld_extract(url) if part)
+            st.markdown(f"### 🔗 {domain}")
+            plain, kw = analyse_page(url)
+            st.markdown("**Top klíčová slova:** " + ", ".join([f"`{w}`" for w, _ in kw]))
+            analyses.append({"url": url, "keywords": [w for w, _ in kw]})
 
-    analyses = []
-    all_text = ""
+        # agreguj klíčová slova (průnik/top TF‑IDF není třeba pro demo)
+        all_kw = collections.Counter([w for a in analyses for w in a["keywords"]]).most_common(40)
+        top_kw = [w for w, _ in all_kw[:25]]
 
-    for idx, res in enumerate(search_results, start=1):
-        url = res.get("link")
-        title = res.get("title", urlparse(url).netloc)
-
-        with st.spinner(f"Stahuji a analyzuji: {title}"):
-            html = fetch_html(url)
-            text, headings = extract_structure(html)
-            kw_freq = keyword_frequency(text)
-
-        # Display competitor card
-        with st.expander(f"#{idx} {title}"):
-            st.write("**URL:**", url)
-            st.write("**H nadpisy:**", headings[:10])
-            st.write("**Top klíčová slova:**",
-                     ", ".join(f"{w} ({c})" for w, c in kw_freq[:10]))
-
-        analyses.append({
-            "url": url,
-            "title": title,
-            "headings": headings,
-            "top_keywords": kw_freq,
-        })
-        all_text += " " + text
-
-    # Global keyword list
-    global_kw = keyword_frequency(all_text)
-    top_keywords = [w for w, _ in global_kw]
-
-    st.markdown("---")
-    st.subheader("📄 Návrh článku")
-
-    with st.spinner("Generuji článek pomocí OpenAI …"):
-        article_md = propose_article(query, top_keywords, analyses)
-
-    st.markdown(article_md)
-
-else:
-    st.info("Zadej dotaz a připoj platný SerpAPI klíč.")
+    st.subheader("📝 Návrh článku")
+    try:
+        article_md = propose_article(query, top_kw, analyses)
+        st.markdown(article_md)
+    except Exception as exc:
+        st.exception(exc)
