@@ -1,9 +1,9 @@
 """
 seo_article_generator.py
 
-Streamlit app:
-1) Načte TOP 3 Google výsledky přes SerpAPI
-2) Vytáhne a analyzuje klíčová slova (frekvence + jednoduché TF-IDF)
+Streamlit aplikace, která:
+1) Vyhledá TOP 3 výsledky Googlu přes SerpAPI
+2) Stáhne jejich HTML (správně rozpozná kódování) a vytáhne klíčová slova
 3) Vygeneruje **pouze osnovu** článku (H1/H2/H3 + bullet-pointy),
    meta-title, meta-description a návrhy interních odkazů.
 
@@ -14,45 +14,45 @@ Potřebné proměnné prostředí / Streamlit Secrets:
 
 import os
 import re
-import math
 import requests
-from collections import Counter, defaultdict
+from collections import Counter
 
 import streamlit as st
 from bs4 import BeautifulSoup
-from serpapi import GoogleSearch      # správný modul
+from serpapi import GoogleSearch
 from openai import OpenAI
 import tldextract
 
-# ───────────────────────────────────────────────────────────────────────────────
-# API klíče
+# ─────────────────────────────────────────────────────────────────────────────
+# API klíče & klient
 SERP_API_KEY = os.getenv("SERPAPI_API_KEY")
-client       = OpenAI()              # načte OPENAI_API_KEY z env
+client = OpenAI()  # načte OPENAI_API_KEY z env
 
-# základní stop-slova EN + CZ
-STOP_WORDS = set("""
-the a an and or of to in on for with is are be as at by this that from it its
-will was were has have had but not your you
-a i k o u s v z na že se je jsou by byl byla bylo aby do od po pro pod nad
-který která které co to toto tyto ten ta tím tuto tu jako kde kdy jak tak také bez
-""".split())
+# základní stop-slova (CZ + EN)
+STOP_WORDS = {
+    # English
+    "the","a","an","and","or","of","to","in","on","for","with","is","are","be",
+    "as","at","by","this","that","from","it","its","will","was","were","has","have",
+    "had","but","not","your","you",
+    # Czech
+    "a","i","k","o","u","s","v","z","na","že","se","je","jsou","by","byl","byla",
+    "bylo","aby","do","od","po","pro","pod","nad","který","která","které","co","to",
+    "ten","ta","tím","tuto","tu","jako","kde","kdy","jak","tak","také","bez"
+}
 
-# ───────────────────────────────────────────────────────────────────────────────
-def detect_intent(query: str) -> str:
-    q = query.lower()
-    trans = {"koupit", "cena", "objednat", "recenze", "srovnání", "discount"}
-    if any(w in q for w in trans):
-        return "transactional"
-    if q.startswith(("jak", "co", "proč", "kdy", "kde", "who", "how", "what", "why")):
-        return "informational"
-    return "informational"
-
+# ─────────────────────────────────────────────────────────────────────────────
 def fetch_html(url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (SEOOutlineBot/1.0)"}
+    """
+    Stáhne HTML a vynutí správné kódování, aby nezůstalo mojibake.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SEOArticleBot/1.0; +https://example.com/bot)"
+    }
     try:
         r = requests.get(url, headers=headers, timeout=15)
         if r.ok:
-            # opravíme kódování, aby se netvořilo mojibake
+            # pokud server neposílá encoding, nebo poslal UTF-8 chybně,
+            # použij heuristiku requests.apparent_encoding
             if not r.encoding or r.encoding.lower() == "utf-8":
                 r.encoding = r.apparent_encoding or "utf-8"
             return r.text
@@ -61,125 +61,125 @@ def fetch_html(url: str) -> str:
     return ""
 
 def keyword_frequency(text: str, top_n: int = 20):
-    # pouze písmena, min. délka 3
+    """
+    Extrahuje tokeny pouze z písmen (min. 3 znaky),
+    odfiltruje stop-slova a vrátí top_n nejčastějších.
+    """
+    # \b hranice slova, [^\W\d_] = jen písmena Unicode, {3,} minimálně tři
     tokens = re.findall(r"\b[^\W\d_]{3,}\b", text.lower(), flags=re.UNICODE)
-    tokens = [t for t in tokens if t not in STOP_WORDS]
-    return Counter(tokens).most_common(top_n)
-
-def get_tfidf_keywords(docs: list[str], top_n: int = 10):
-    N = len(docs)
-    # document frequencies
-    df = defaultdict(int)
-    for doc in docs:
-        seen = set(re.findall(r"\b[^\W\d_]{3,}\b", doc.lower(), flags=re.UNICODE))
-        for t in seen:
-            if t not in STOP_WORDS:
-                df[t] += 1
-    # term frequencies across all docs
-    tf = Counter()
-    for doc in docs:
-        tf.update([t for t in re.findall(r"\b[^\W\d_]{3,}\b", doc.lower(), flags=re.UNICODE)
-                   if t not in STOP_WORDS])
-    # compute TF-IDF
-    scores = {t: tf[t] * math.log(N/(1+df[t])) for t in tf}
-    top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    return [t for t, _ in top]
+    filtered = [t for t in tokens if t not in STOP_WORDS]
+    return Counter(filtered).most_common(top_n)
 
 def analyse_page(url: str):
+    """
+    Stáhne stránku, očistí skripty/styly, vrátí náhled textu a KW.
+    """
     html = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script","style","noscript"]):
         tag.extract()
     text = " ".join(soup.stripped_strings)
-    kw, preview = keyword_frequency(text), text[:2000]
-    return preview, kw, text  # náhled, KW, celý text
+    kw = keyword_frequency(text)
+    return text[:2000], kw  # náhled první 2000 znaků + seznam (slovo, četnost)
 
-def search_google(query: str, n: int = 3):
+def search_google(query: str, num_results: int = 3):
+    """
+    Vrátí organické výsledky SerpAPI pro zadaný dotaz.
+    """
     params = {
         "engine": "google",
         "q": query,
-        "num": n,
+        "num": num_results,
         "api_key": SERP_API_KEY,
         "hl": "cs",
     }
-    res = GoogleSearch(params).get_dict().get("organic_results", [])
-    return res[:n]
+    results = GoogleSearch(params).get_dict()
+    return results.get("organic_results", [])[:num_results]
 
-def propose_outline(query, intent, top_kw, tfidf_kw, analyses):
+def propose_outline(query: str, top_keywords, analyses):
+    """
+    Vygeneruje jen **osnovu** článku v Markdownu:
+      • H1/H2/H3 + bullet-pointy
+      • meta-title (≤60 char), meta-description (≤155 char)
+      • návrhy 3–5 interních odkazů
+    """
     system = (
         "You are an expert Czech SEO strategist. "
         "Generate ONLY a detailed outline (H1, H2, optional H3) with bullet-point notes, "
-        "include a meta-title (<=60 chars) and meta-description (<=155 chars), "
+        "a meta-title (<=60 chars) and meta-description (<=155 chars), "
         "and suggest 3–5 internal links (anchor text + slug). "
         "Do NOT write full paragraphs."
     )
-    user  = (
+    user = (
         f"Search query: {query}\n"
-        f"Search intent: {intent}\n"
-        f"Primary keywords: {', '.join(top_kw[:10])}\n"
-        f"TF-IDF keywords: {', '.join(tfidf_kw)}\n\n"
+        f"Aggregated competitor keywords: {', '.join(top_keywords)}\n\n"
         "Competitor snapshot:\n"
     )
-    for i,a in enumerate(analyses,1):
-        user += f"{i}. {a['url']}\n   KW: {', '.join(a['keywords'][:10])}\n"
+    for i, a in enumerate(analyses, 1):
+        user += f"{i}. {a['url']}\n   keywords: {', '.join(a['keywords'])[:120]}\n"
+
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role":"system", "content": system},
             {"role":"user",   "content": user}
         ],
-        max_tokens=900,
-        temperature=0.7
+        max_tokens=1024,
+        temperature=0.7,
     )
     return resp.choices[0].message.content.strip()
 
-# ───────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="SEO Outline Generator", page_icon="🔍")
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+st.set_page_config(page_title="SEO Article Outline Generator", page_icon="🔍")
 st.title("🔍 SEO Article Outline Generator")
 
-query = st.text_input("Zadej vyhledávací dotaz")
+query = st.text_input("Zadej vyhledávací dotaz", value="")
 if query:
     if not SERP_API_KEY or not os.getenv("OPENAI_API_KEY"):
-        st.error("❌ Chybí SERPAPI_API_KEY nebo OPENAI_API_KEY.")
+        st.error("❌ Chybí `SERPAPI_API_KEY` nebo `OPENAI_API_KEY`.")
         st.stop()
 
-    intent = detect_intent(query)
-    st.caption(f"Detekovaný intent: **{intent}**")
-    st.info("⏳ Vyhledávám konkurenci…")
-
+    st.info("⏳ Vyhledávám a analyzuji konkurenci…")
     results = search_google(query)
     if not results:
-        st.error("SerpAPI nevrátilo žádné výsledky.")
+        st.error("Google/SerpAPI nevrátil žádné výsledky.")
         st.stop()
 
-    analyses, docs = [], []
+    analyses = []
     for res in results:
         url   = res.get("link")
-        title = res.get("title", url)
+        title = res.get("title") or url
+
         st.subheader(title)
-        ext = tldextract.extract(url)
-        domain = ".".join(p for p in [ext.domain, ext.suffix] if p) or url
+        # doména (např. example.com)
+        try:
+            ext = tldextract.extract(url)
+            domain = ".".join(p for p in [ext.domain, ext.suffix] if p)
+        except Exception:
+            domain = url
         st.caption(domain)
 
-        preview, kw, full = analyse_page(url)
-        docs.append(full)
-        st.markdown("**Top klíčová slova:** " + ", ".join(f"`{w}`" for w,_ in kw))
+        preview, kw = analyse_page(url)
+        st.markdown(
+            "**Top klíčová slova konkurence:** "
+            + ", ".join(f"`{w}`" for w, _ in kw)
+        )
         with st.expander("Ukázka textu"):
             st.write(preview)
 
-        analyses.append({"url": url, "keywords": [w for w,_ in kw]})
+        analyses.append({"url": url, "keywords": [w for w, _ in kw]})
 
-    # agregace
+    # agregace klíčových slov napříč konkurencí
     combined = Counter()
     for a in analyses:
         combined.update(a["keywords"])
-    top_kw   = [w for w,_ in combined.most_common(40)]
-    tfidf_kw = get_tfidf_keywords(docs, top_n=12)
+    top_kw = [w for w, _ in combined.most_common(30)]
 
     st.info("📝 Generuji osnovu článku…")
-    outline = propose_outline(query, intent, top_kw, tfidf_kw, analyses)
+    outline_md = propose_outline(query, top_kw, analyses)
 
     st.markdown("---")
-    st.subheader("📄 Návrh (outline)")
-    st.markdown(outline, unsafe_allow_html=True)
+    st.subheader("📄 Návrh (outline) SEO článku")
+    st.markdown(outline_md, unsafe_allow_html=True)
     st.success("✅ Osnova vygenerována!")
