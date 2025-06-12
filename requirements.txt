@@ -1,7 +1,9 @@
 streamlit
 google-search-results>=2.4.2
 beautifulsoup4
-openai
 tldextract
-scikit-learn
-nltk
+openai>=1.30.0
+numpy==1.26.4
+scipy==1.11.4
+scikit-learn==1.4.2
+nltk==3.9.1
