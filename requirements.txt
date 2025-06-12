@@ -5,5 +5,3 @@ openai
 tldextract
 scikit-learn
 nltk
-CzechStemmer
-EnglishStemmer
